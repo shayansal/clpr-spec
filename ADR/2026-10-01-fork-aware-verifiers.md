@@ -166,6 +166,10 @@ A profile is **armed** for a Channel when all of these hold:
    already armed on this Channel. Forks cannot be skipped or reordered, and a Channel that missed several forks
    catches up by arming each in turn.
 4. **Unique.** No other profile with the same `fork_id` is armed on this Channel.
+5. **Fresh.** The proven configuration's `timestamp` is at or after the registration time, and at or after the
+   newest configuration `timestamp` any earlier `verifyForkProfile` call on this Channel proved. The trust anchor
+   records that newest timestamp, so profile proofs never move backwards. A source veto therefore takes effect
+   against every later proof.
 
 Neither party can arm a profile alone. Either party can veto it before activation: the source by removing it
 from its configuration, the destination by withdrawing the registration. After activation an armed profile is
@@ -228,8 +232,9 @@ message ClprLedgerConfiguration {
 }
 ```
 
-A ledger MUST NOT send field 8, or the `channel_succession` control variant, on a Channel whose peer reported a
-`protocol_version` below 2 in its configuration. A peer at version 1 therefore never sees fields it cannot parse.
+Each Channel runs at `channel_protocol_version = min(local protocol_version, peer protocol_version)`, recomputed
+whenever either configuration changes. ConfigUpdates on a Channel are encoded at that version: a ledger at version 2
+sends a peer at version 1 a version-1 ConfigUpdate without field 8, so upgrading one side never breaks the other.
 
 ### 3.6 Deadlines and emergencies
 
@@ -240,7 +245,9 @@ signer rotations, after activation, so bundles already in flight are not lost.
 
 An upgrade announced less than `T` before its activation is an emergency. The destination admin MAY register with
 a shorter timelock `T_e` of at least 24 hours, and the Channel MUST emit `ClprEmergencyFork(channel_id, fork_id)`
-so applications can react. If even `T_e` cannot be met, the Channel stalls (§3.9) and recovers by succession.
+when that registration is made, so applications can react before it arms. `verifyForkProfile` MUST check the
+profile's `activation` against the fork evidence of the proofs it accepts (for Ethereum, the proven `fork.epoch`),
+so neither admin can shorten the delay by announcing an early activation. If even `T_e` cannot be met, the Channel stalls (§3.9) and recovers by succession.
 
 ### 3.7 Class C: Channel succession
 
@@ -273,25 +280,37 @@ predecessor_last_message_id : uint64
 
 Rules:
 
-- The successor is created with `completeChannel` as usual. Its verifier needs the same dual control as a profile:
-  the destination admin registers the successor's verifier code hash with `registerSuccessor(predecessor_id,
-  successor_id, verifier_code_hash)`, at least `T` before linking.
-- After `ClprChannelSuccession` is enqueued, the source Service MUST refuse `sendMessage` on the predecessor.
-- **Hand-off by proof.** The successor's first bundle MAY carry the predecessor's undelivered messages, from the
+- **Pinned successor.** The destination admin registers the successor with
+  `registerSuccessor(predecessor_id, successor_id, verifier_code_hash, anchor_hash)`, where
+  `anchor_hash = H(initial_trust_anchor ‖ channel_context)` of the successor. The registration must be at least `T`
+  old before the successor is linked, and `completeChannel` for the successor MUST produce exactly that verifier
+  code hash and anchor hash. Whoever creates the successor therefore cannot choose its signers or its verifier.
+- **Link by proof, not by queue.** The source Service records `ClprChannelSuccession` in the predecessor Channel's
+  own state. The destination links the two Channels when the successor's verifier proves that record from the
+  source ledger's storage. The record is never queued on the predecessor, so a predecessor that can no longer
+  verify anything can still be succeeded.
+- After recording the succession, the source Service MUST refuse `sendMessage` on the predecessor.
+- **Hand-off by proof.** The successor's bundles MAY carry the predecessor's undelivered messages, from the
   predecessor's `received_message_id + 1` to `last_message_id`, proven from the source ledger's storage of the
-  predecessor queue by the successor's verifier. The predecessor's own delivery is not required, so a predecessor
-  that can no longer verify anything still hands off every message.
+  predecessor queue by the successor's verifier.
 - The destination Service MUST deliver the predecessor's messages, by whichever Channel proves them first, before
-  any successor Data Message, and MUST deliver each message id exactly once across both Channels.
-- Applications MUST opt in to following a succession with `followSuccession(channel_id)`. Until they do, messages
-  for them are held in order.
+  any successor Data Message, and MUST deliver each message id exactly once across both Channels. Once
+  `last_message_id` is delivered, the predecessor moves to `DRAINED`.
+- **Replies settle on the predecessor.** A Response to a handed-off message carries `(predecessor_id, message_id)`
+  and travels on the successor; the source Service settles it against the predecessor's queue and connector
+  escrow, so the predecessor can reach `CLOSED`.
+- **Opt-in with a deadline.** Applications follow a succession by calling `followSuccession(channel_id)`. Messages
+  for an application that has not opted in are held per application, not in the shared stream, so they never
+  block other applications. After a deadline `D` (default 7 days) the Service answers each held Data Message
+  with a failure Response `SUCCESSION_NOT_FOLLOWED`.
+- `successorOf(channel_id)` returns the linked successor, if any.
 
 ### 3.8 Trust anchor contents
 
 A fork-aware trust anchor carries, in its verifier-defined encoding:
 
 ```
-current_fork_id   : bytes     // fork of the newest accepted proof
+current_fork_id   : bytes     // latest fork, by predecessor order, of any accepted proof; never moves back
 previous_fork_id  : bytes     // kept so pre-fork proofs still verify after activation
 armed_profiles    : list of { profile_hash : bytes, fork_id : bytes, activation : bytes, layout : bytes }
 ```
@@ -374,6 +393,8 @@ To be completed once the design is accepted. Known changes:
 - Verifier interface: add `verifyForkProfile`.
 - Service interface: add `submitForkProfile`, `registerForkProfile`, `withdrawForkProfile`, `registerSuccessor`,
   `followSuccession` and `successorOf`.
+- Response messages: add the optional predecessor reference for handed-off messages, and the
+  `SUCCESSION_NOT_FOLLOWED` status.
 
 ## Appendix B: Implementation Notes
 
@@ -404,7 +425,8 @@ Every family other than Ethereum needs confirmation by its verifier's authors be
 
 The EVM Service's `BundleLogic` has about 1.7 KB of headroom. The new Service functions belong in a separate
 `ForkLogic` module, following the existing logic-module pattern, and profile decoding in a shared library
-contract used by all fork-aware verifiers.
+contract used by all fork-aware verifiers. Hand-off delivery and the exactly-once cursor across two Channels sit
+on the bundle path, so their decoding belongs in `BundleDecodeHelper`, and `BundleLogic` may need to be split.
 
 ### B.4 Cost
 
